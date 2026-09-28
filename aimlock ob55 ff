@@ -1,0 +1,458 @@
+// aimlock.cpp — FF silent aim, single-file, all modes
+// build:
+//   aarch64-linux-android21-clang++ -shared -fPIC -O2 -std=c++17 \
+//     -I/path/Dobby/include -o libff.so aimlock.cpp \
+//     /path/Dobby/build/libdobby.a -llog -ldl -Wl,--no-undefined
+#include <jni.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <dlfcn.h>
+#include <android/log.h>
+#include <link.h>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include "dobby.h"
+
+#define LOG(...) __android_log_print(ANDROID_LOG_INFO, "AIM", __VA_ARGS__)
+
+// ---------------- il2cpp API ----------------
+typedef void*    (*fn_domain_get)();
+typedef void**   (*fn_domain_get_assemblies)(void*, size_t*);
+typedef void*    (*fn_assembly_get_image)(void*);
+typedef void*    (*fn_class_from_name)(void*, const char*, const char*);
+typedef void*    (*fn_class_get_method_from_name)(void*, const char*, int);
+typedef void*    (*fn_class_get_field_from_name)(void*, const char*);
+typedef int32_t  (*fn_field_get_offset)(void*);
+typedef void*    (*fn_runtime_invoke)(void*, void*, void**, void**);
+typedef void*    (*fn_thread_attach)(void*);
+
+static fn_domain_get                 p_domain_get;
+static fn_domain_get_assemblies      p_domain_get_assemblies;
+static fn_assembly_get_image         p_assembly_get_image;
+static fn_class_from_name            p_class_from_name;
+static fn_class_get_method_from_name p_class_get_method_from_name;
+static fn_class_get_field_from_name  p_class_get_field_from_name;
+static fn_field_get_offset           p_field_get_offset;
+static fn_runtime_invoke             p_runtime_invoke;
+static fn_thread_attach              p_thread_attach;
+
+// ---------------- lib range ----------------
+static uintptr_t g_lib_base = 0;
+static size_t    g_lib_size = 0;
+
+static int phdr_cb(struct dl_phdr_info* info, size_t, void*) {
+    if (strstr(info->dlpi_name, "libil2cpp.so")) {
+        g_lib_base = (uintptr_t)info->dlpi_addr;
+        for (int i = 0; i < info->dlpi_phnum; i++) {
+            const auto& ph = info->dlpi_phdr[i];
+            if (ph.p_type == PT_LOAD) {
+                uintptr_t end = info->dlpi_addr + ph.p_vaddr + ph.p_memsz;
+                if (end > g_lib_base + g_lib_size) g_lib_size = end - g_lib_base;
+            }
+        }
+        return 1;
+    }
+    return 0;
+}
+static bool is_in_lib(void* p) {
+    uintptr_t a = (uintptr_t)p;
+    return a >= g_lib_base && a < g_lib_base + g_lib_size;
+}
+
+struct V3  { float x, y, z; };
+struct Ray { V3 origin; V3 dir; };
+
+// ---------------- CONFIG ----------------
+// ĐÂY LÀ PHẦN M PHẢI CHỈNH THEO FF VERSION HIỆN TẠI.
+// Cách lấy: dump libil2cpp.so từ APK bằng Il2CppDumper, mở dump.cs,
+// grep tên class/field tương ứng, sửa vào đây.
+struct Config {
+    // player class — nơi chứa transform + team + animator
+    const char* player_class_ns   = "";
+    const char* player_class_name = "PlayerEntity";
+    const char* f_transform       = "m_Transform";
+    const char* f_team            = "team";
+    const char* f_animator        = "animator";
+    const char* head_bone_name    = "Bip001 Head";
+    float       head_fallback_h   = 1.61f;
+
+    // manager — nơi giữ list tất cả player
+    const char* mgr_class_ns      = "";
+    const char* mgr_class_name    = "PlayerManager";
+    const char* mgr_instance      = "instance";
+    const char* player_list_field = "allPlayers";
+
+    // Unity
+    const char* cam_class_ns      = "UnityEngine";
+    const char* cam_class_name    = "Camera";
+    const char* cam_main_method   = "get_main";
+    const char* cam_spr_method    = "ScreenPointToRay";
+    const char* cam_w2s_method    = "WorldToScreenPoint";
+
+    const char* tr_class_ns       = "UnityEngine";
+    const char* tr_class_name     = "Transform";
+    const char* tr_get_pos        = "get_position";
+
+    const char* anim_class_ns     = "UnityEngine";
+    const char* anim_class_name   = "Animator";
+    const char* anim_get_bone     = "GetBoneTransform";
+
+    const char* physics_class_ns  = "UnityEngine";
+    const char* physics_class_name= "Physics";
+    const char* physics_raycast   = "Raycast";
+
+    // tuning runtime — tuỳ mode
+    float   fov_px               = 320.0f;
+    float   max_dist             = 180.0f;
+    float   min_dist             = 1.5f;
+    float   screen_w             = 1920.0f;
+    float   screen_h             = 1080.0f;
+    int     tick_us              = 8000;
+
+    bool    use_visibility_check = true;
+    bool    fire_gate            = true;
+    bool    solo_auto_detect     = true;
+};
+static Config CFG;
+
+// ---------------- refs ----------------
+struct Refs {
+    void* player_class = nullptr;
+    void* mgr_class    = nullptr;
+    void* tr_class     = nullptr;
+    void* cam_class    = nullptr;
+    void* anim_class   = nullptr;
+    void* phys_class   = nullptr;
+
+    int off_transform = -1;
+    int off_team      = -1;
+    int off_animator  = -1;
+    int off_list      = -1;
+
+    void* m_tr_get_pos  = nullptr;
+    void* m_w2s         = nullptr;
+    void* m_get_maincam = nullptr;
+    void* m_anim_bone   = nullptr;
+    void* m_raycast     = nullptr;
+};
+static Refs G;
+
+// ---------------- state ----------------
+static void* g_local_player = nullptr;
+static void* g_main_camera  = nullptr;
+static int   g_local_team   = -1;
+static bool  g_solo_mode    = false;
+static int   g_mates_count  = -1;
+
+static volatile float g_tgt_screen_x = 0;
+static volatile float g_tgt_screen_y = 0;
+static volatile bool  g_tgt_valid    = false;
+
+static volatile int64_t g_last_spr_us = 0;
+static volatile int     g_spr_burst   = 0;
+
+// ---------------- helpers ----------------
+static void* find_class(const char* ns, const char* name) {
+    size_t n = 0;
+    void** asms = p_domain_get_assemblies(p_domain_get(), &n);
+    if (!asms) return nullptr;
+    for (size_t i = 0; i < n; i++) {
+        void* img = p_assembly_get_image(asms[i]);
+        if (!img) continue;
+        void* k = p_class_from_name(img, ns, name);
+        if (k) return k;
+    }
+    return nullptr;
+}
+static void* invoke0(void* m, void* o) {
+    if (!m) return nullptr;
+    void* exc = nullptr;
+    return p_runtime_invoke(m, o, nullptr, &exc);
+}
+static void* invoke1(void* m, void* o, void* a1) {
+    if (!m) return nullptr;
+    void* args[1] = { a1 };
+    void* exc = nullptr;
+    return p_runtime_invoke(m, o, args, &exc);
+}
+static void read_v3(void* b, float& x, float& y, float& z) {
+    if (!b) { x=y=z=0; return; }
+    float* p = (float*)((uint8_t*)b + 16);
+    x = p[0]; y = p[1]; z = p[2];
+}
+static __thread float _v3[3];
+static void* v3(float x, float y, float z) { _v3[0]=x; _v3[1]=y; _v3[2]=z; return _v3; }
+static inline void* list_items(void* l) { return *(void**)((uint8_t*)l + 0x10); }
+static inline int   list_size (void* l) { return *(int*)((uint8_t*)l + 0x18); }
+
+static void* method_native(void* mi) {
+    if (!mi) return nullptr;
+    for (int off : {0, 8, 16}) {
+        void* p = *(void**)((uint8_t*)mi + off);
+        if (p && is_in_lib(p)) return p;
+    }
+    return nullptr;
+}
+
+static int64_t now_us() {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec*1000000LL + ts.tv_nsec/1000;
+}
+
+// ---------------- head bone ----------------
+static bool get_head_world(void* plr, float& hx, float& hy, float& hz) {
+    if (G.off_animator >= 0 && G.m_anim_bone) {
+        void* anim = *(void**)((uint8_t*)plr + G.off_animator);
+        if (anim) {
+            void* head = invoke1(G.m_anim_bone, anim, (void*)(intptr_t)10);
+            if (head) {
+                void* pos = invoke0(G.m_tr_get_pos, head);
+                if (pos) { read_v3(pos, hx, hy, hz); return true; }
+            }
+        }
+    }
+    void* tr = *(void**)((uint8_t*)plr + G.off_transform);
+    if (!tr) return false;
+    void* pos = invoke0(G.m_tr_get_pos, tr);
+    if (!pos) return false;
+    read_v3(pos, hx, hy, hz);
+    hy += CFG.head_fallback_h;
+    return true;
+}
+
+// ---------------- visibility ----------------
+static bool has_los(void* cam, float hx, float hy, float hz) {
+    if (!CFG.use_visibility_check || !G.m_raycast) return true;
+
+    void* cp = invoke0(G.m_tr_get_pos, cam);
+    float cx, cy, cz; read_v3(cp, cx, cy, cz);
+
+    float dx = hx - cx, dy = hy - cy, dz = hz - cz;
+    float len = sqrtf(dx*dx + dy*dy + dz*dz);
+    if (len < 0.001f) return true;
+    dx /= len; dy /= len; dz /= len;
+
+    float ray[6] = { cx, cy, cz, dx, dy, dz };
+    uint8_t hit[256]; memset(hit, 0, sizeof(hit));
+    float maxd = len - 0.15f;
+    int mask = ~0;
+    int qti  = 1;
+
+    void* args[5] = { ray, hit, &maxd, (void*)(intptr_t)mask, (void*)(intptr_t)qti };
+    void* exc = nullptr;
+    void* r = p_runtime_invoke(G.m_raycast, nullptr, args, &exc);
+    if (!r) return true;
+    uint8_t v = *(uint8_t*)((uint8_t*)r + 16);
+    return v == 0;
+}
+
+// ---------------- fire gate ----------------
+static bool is_firing_guess() {
+    if (!CFG.fire_gate) return true;
+    int64_t t = now_us();
+    if (t - g_last_spr_us < 16000) g_spr_burst++;
+    else g_spr_burst = 1;
+    g_last_spr_us = t;
+    return g_spr_burst >= 2;
+}
+
+// ---------------- SPR hook ----------------
+typedef Ray (*SprFn)(void*, V3);
+static SprFn g_spr_orig = nullptr;
+
+static Ray hook_spr(void* cam, V3 pos) {
+    if (cam == g_main_camera && g_tgt_valid && is_firing_guess()) {
+        V3 r{ g_tgt_screen_x, g_tgt_screen_y, 0.0f };
+        return g_spr_orig(cam, r);
+    }
+    return g_spr_orig(cam, pos);
+}
+
+// ---------------- target selection ----------------
+static void update_target() {
+    g_tgt_valid = false;
+    if (!g_local_player || !g_main_camera || !G.mgr_class) return;
+
+    void* mf = p_class_get_field_from_name(G.mgr_class, CFG.mgr_instance);
+    if (!mf) return;
+    int off = p_field_get_offset(mf);
+    void* mgr = *(void**)((uint8_t*)G.mgr_class + off);
+    if (!mgr || G.off_list < 0) return;
+
+    void* list = *(void**)((uint8_t*)mgr + G.off_list);
+    if (!list) return;
+
+    void* items = list_items(list);
+    int   size  = list_size(list);
+    if (!items || size <= 0) return;
+
+    // solo detect
+    if (CFG.solo_auto_detect) {
+        int mates = 0;
+        void** arr = (void**)((uint8_t*)items + 0x10);
+        for (int i = 0; i < size; i++) {
+            void* p = arr[i];
+            if (!p || p == g_local_player) continue;
+            int t = *(int*)((uint8_t*)p + G.off_team);
+            if (t == g_local_team) mates++;
+        }
+        if (mates != g_mates_count) {
+            g_mates_count = mates;
+            g_solo_mode = (mates == 0);
+            LOG("mode=%s mates=%d", g_solo_mode?"SOLO":"SQUAD", mates);
+        }
+    }
+
+    void* cpb = invoke0(G.m_tr_get_pos, g_main_camera);
+    float cx, cy, cz; read_v3(cpb, cx, cy, cz);
+
+    float best = CFG.fov_px, bx = 0, by = 0;
+    bool  found = false;
+
+    void** arr = (void**)((uint8_t*)items + 0x10);
+    for (int i = 0; i < size; i++) {
+        void* plr = arr[i];
+        if (!plr || plr == g_local_player) continue;
+
+        int t = *(int*)((uint8_t*)plr + G.off_team);
+        if (!g_solo_mode && t == g_local_team) continue;
+
+        float hx, hy, hz;
+        if (!get_head_world(plr, hx, hy, hz)) continue;
+
+        float dx = hx-cx, dy = hy-cy, dz = hz-cz;
+        float d  = sqrtf(dx*dx + dy*dy + dz*dz);
+        if (d < CFG.min_dist || d > CFG.max_dist) continue;
+        if (!has_los(g_main_camera, hx, hy, hz)) continue;
+
+        void* sb = invoke1(G.m_w2s, g_main_camera, v3(hx, hy, hz));
+        float sx, sy, sz; read_v3(sb, sx, sy, sz);
+        if (sz < 0.0f) continue;
+
+        float sdx = sx - CFG.screen_w*0.5f;
+        float sdy = sy - CFG.screen_h*0.5f;
+        float sd  = sqrtf(sdx*sdx + sdy*sdy);
+
+        if (sd < best) { best = sd; bx = sx; by = sy; found = true; }
+    }
+
+    if (found) {
+        g_tgt_screen_x = bx;
+        g_tgt_screen_y = by;
+        g_tgt_valid    = true;
+    }
+}
+
+// ---------------- worker ----------------
+static void* worker(void*) {
+    p_thread_attach(p_domain_get());
+    LOG("worker attached");
+    usleep(2000000);
+
+    while (true) {
+        if (!G.player_class) {
+            G.player_class = find_class(CFG.player_class_ns, CFG.player_class_name);
+            G.mgr_class    = find_class(CFG.mgr_class_ns,    CFG.mgr_class_name);
+            G.tr_class     = find_class(CFG.tr_class_ns,     CFG.tr_class_name);
+            G.cam_class    = find_class(CFG.cam_class_ns,    CFG.cam_class_name);
+            G.anim_class   = find_class(CFG.anim_class_ns,   CFG.anim_class_name);
+            G.phys_class   = find_class(CFG.physics_class_ns,CFG.physics_class_name);
+
+            if (G.player_class && G.mgr_class && G.tr_class && G.cam_class) {
+                G.off_transform = p_field_get_offset(
+                    p_class_get_field_from_name(G.player_class, CFG.f_transform));
+                G.off_team = p_field_get_offset(
+                    p_class_get_field_from_name(G.player_class, CFG.f_team));
+                G.off_animator = p_field_get_offset(
+                    p_class_get_field_from_name(G.player_class, CFG.f_animator));
+                G.off_list = p_field_get_offset(
+                    p_class_get_field_from_name(G.mgr_class, CFG.player_list_field));
+
+                G.m_tr_get_pos  = p_class_get_method_from_name(G.tr_class, CFG.tr_get_pos, 0);
+                G.m_w2s         = p_class_get_method_from_name(G.cam_class, CFG.cam_w2s_method, 1);
+                G.m_get_maincam = p_class_get_method_from_name(G.cam_class, CFG.cam_main_method, 0);
+                if (G.anim_class)
+                    G.m_anim_bone = p_class_get_method_from_name(G.anim_class, CFG.anim_get_bone, 1);
+                if (G.phys_class)
+                    G.m_raycast = p_class_get_method_from_name(G.phys_class, CFG.physics_raycast, 5);
+
+                LOG("bound tf=%d tm=%d an=%d li=%d",
+                    G.off_transform, G.off_team, G.off_animator, G.off_list);
+            }
+        }
+
+        if (G.player_class && !g_local_player) {
+            void* mf = p_class_get_field_from_name(G.mgr_class, CFG.mgr_instance);
+            if (mf) {
+                int off = p_field_get_offset(mf);
+                void* mgr = *(void**)((uint8_t*)G.mgr_class + off);
+                if (mgr && G.off_list >= 0) {
+                    void* list = *(void**)((uint8_t*)mgr + G.off_list);
+                    if (list) {
+                        void* items = list_items(list);
+                        int sz = list_size(list);
+                        if (items && sz > 0) {
+                            void** arr = (void**)((uint8_t*)items + 0x10);
+                            g_local_player = arr[0];
+                            if (g_local_player) {
+                                g_local_team  = *(int*)((uint8_t*)g_local_player + G.off_team);
+                                g_main_camera = invoke0(G.m_get_maincam, G.cam_class);
+                                LOG("local team=%d cam=%p", g_local_team, g_main_camera);
+
+                                if (g_main_camera && G.cam_class && !g_spr_orig) {
+                                    void* spm = p_class_get_method_from_name(
+                                        G.cam_class, CFG.cam_spr_method, 1);
+                                    void* nat = method_native(spm);
+                                    if (nat) {
+                                        int rc = DobbyHook((void*)nat, (void*)hook_spr,
+                                                          (void**)&g_spr_orig);
+                                        LOG("SPR hook rc=%d nat=%p", rc, nat);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (g_local_player) update_target();
+        usleep(CFG.tick_us);
+    }
+    return nullptr;
+}
+
+// ---------------- bootstrap ----------------
+static bool bind_il2cpp() {
+    void* h = dlopen("libil2cpp.so", RTLD_NOW);
+    if (!h) return false;
+    #define BIND(nm, v) v = (fn_##nm)dlsym(h, "il2cpp_" #nm); if (!v) return false;
+    BIND(domain_get,                 p_domain_get)
+    BIND(domain_get_assemblies,      p_domain_get_assemblies)
+    BIND(assembly_get_image,         p_assembly_get_image)
+    BIND(class_from_name,            p_class_from_name)
+    BIND(class_get_method_from_name, p_class_get_method_from_name)
+    BIND(class_get_field_from_name,  p_class_get_field_from_name)
+    BIND(field_get_offset,           p_field_get_offset)
+    BIND(runtime_invoke,             p_runtime_invoke)
+    BIND(thread_attach,              p_thread_attach)
+    #undef BIND
+    dl_iterate_phdr(phdr_cb, nullptr);
+    LOG("libil2cpp base=%p size=%zu", (void*)g_lib_base, g_lib_size);
+    return true;
+}
+
+__attribute__((constructor))
+static void on_load() {
+    LOG("libff loaded");
+    pthread_t t;
+    pthread_create(&t, nullptr, [](void*)->void* {
+        for (int i = 0; i < 120; i++) {
+            if (bind_il2cpp()) return worker(nullptr);
+            usleep(500000);
+        }
+        return (void*)nullptr;
+    }, nullptr);
+}
+JNIEXPORT jint JNI_OnLoad(JavaVM*, void*) { return JNI_VERSION_1_6; }
