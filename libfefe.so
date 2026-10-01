@@ -1,0 +1,255 @@
+// libfefe.cpp — silent aim FF, tune cho Vivo Y17 (720x1544, arm64)
+// build: aarch64-linux-android28-clang++ -shared -fPIC -O2 -std=c++17 \
+//        -I Dobby/include -o libff.so libff.cpp Dobby/build/libdobby.a -llog -ldl
+#include <jni.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <dlfcn.h>
+#include <android/log.h>
+#include <link.h>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include "dobby.h"
+
+#define LOG(...) __android_log_print(ANDROID_LOG_INFO, "FF", __VA_ARGS__)
+
+typedef void*  (*fn_domain_get)();
+typedef void** (*fn_domain_get_assemblies)(void*, size_t*);
+typedef void*  (*fn_assembly_get_image)(void*);
+typedef void*  (*fn_class_from_name)(void*, const char*, const char*);
+typedef void*  (*fn_class_get_method_from_name)(void*, const char*, int);
+typedef void*  (*fn_class_get_field_from_name)(void*, const char*);
+typedef int32_t(*fn_field_get_offset)(void*);
+typedef void*  (*fn_runtime_invoke)(void*, void*, void**, void**);
+typedef void*  (*fn_thread_attach)(void*);
+
+static fn_domain_get p_domain_get;
+static fn_domain_get_assemblies p_domain_get_assemblies;
+static fn_assembly_get_image p_assembly_get_image;
+static fn_class_from_name p_class_from_name;
+static fn_class_get_method_from_name p_class_get_method_from_name;
+static fn_class_get_field_from_name p_class_get_field_from_name;
+static fn_field_get_offset p_field_get_offset;
+static fn_runtime_invoke p_runtime_invoke;
+static fn_thread_attach p_thread_attach;
+
+static uintptr_t g_base = 0; static size_t g_size = 0;
+static int phdr_cb(struct dl_phdr_info* i, size_t, void*) {
+    if (strstr(i->dlpi_name, "libil2cpp.so")) {
+        g_base = (uintptr_t)i->dlpi_addr;
+        for (int k=0;k<i->dlpi_phnum;k++){
+            const auto& ph = i->dlpi_phdr[k];
+            if (ph.p_type==PT_LOAD){
+                uintptr_t e = i->dlpi_addr+ph.p_vaddr+ph.p_memsz;
+                if (e > g_base+g_size) g_size = e-g_base;
+            }
+        }
+        return 1;
+    }
+    return 0;
+}
+static bool in_lib(void* p) {
+    uintptr_t a = (uintptr_t)p;
+    return a >= g_base && a < g_base + g_size;
+}
+
+struct V3 { float x,y,z; };
+struct Ray { V3 o; V3 d; };
+
+// ===== CONFIG cho Y17 =====
+static const char* PLAYER_CLS = "PlayerEntity";
+static const char* MGR_CLS    = "PlayerManager";
+static const char* MGR_INST   = "instance";
+static const char* LIST_FLD   = "allPlayers";
+static const char* TR_FLD     = "m_Transform";
+static const char* TEAM_FLD   = "team";
+static const char* PIVOT_FLD  = "aimPivot";
+
+static float HEAD_H  = 1.61f;
+static float FOV_PX  = 220.0f;   // 720p, tâm bán kính 220px
+static float MAX_D   = 150.0f;   // máy yếu, giảm
+static float SCR_W   = 720.0f;
+static float SCR_H   = 1544.0f;
+static int   TICK_US = 10000;    // 100hz, đỡ nóng Helio P35
+// =========================
+
+static void* find_cls(const char* ns, const char* n){
+    size_t c=0; void** a=p_domain_get_assemblies(p_domain_get(),&c);
+    if(!a) return nullptr;
+    for(size_t i=0;i<c;i++){ void* im=p_assembly_get_image(a[i]); if(!im) continue;
+        void* k=p_class_from_name(im,ns,n); if(k) return k; }
+    return nullptr;
+}
+static void* inv0(void* m, void* o){ if(!m) return nullptr; void* e=nullptr; return p_runtime_invoke(m,o,nullptr,&e);}
+static void* inv1(void* m, void* o, void* a1){ if(!m) return nullptr; void* a[1]={a1}; void* e=nullptr; return p_runtime_invoke(m,o,a,&e);}
+static void rv3(void* b, float& x, float& y, float& z){ if(!b){x=y=z=0;return;} float* p=(float*)((uint8_t*)b+16); x=p[0];y=p[1];z=p[2]; }
+static __thread float _v3[3]; static void* v3(float x,float y,float z){_v3[0]=x;_v3[1]=y;_v3[2]=z;return _v3;}
+static inline void* li_items(void* l){return *(void**)((uint8_t*)l+0x10);}
+static inline int li_size(void* l){return *(int*)((uint8_t*)l+0x18);}
+static void* method_native(void* mi){ if(!mi) return nullptr;
+    for(int off:{0,8,16}){ void* p=*(void**)((uint8_t*)mi+off); if(p&&in_lib(p)) return p; }
+    return nullptr; }
+
+// ===== state =====
+static void* g_local  = nullptr;
+static void* g_cam    = nullptr;
+static int   g_team   = -1;
+static volatile float g_tx = 0, g_ty = 0;
+static volatile bool  g_tv = false;
+
+static void* tr_cls = nullptr;
+static void* mgr_cls = nullptr;
+static void* plr_cls = nullptr;
+static void* cam_cls = nullptr;
+static int o_tr=-1, o_tm=-1, o_pv=-1, o_li=-1;
+static void* m_getpos = nullptr;
+static void* m_w2s    = nullptr;
+
+static bool head_world(void* p, float& hx, float& hy, float& hz){
+    void* tr = *(void**)((uint8_t*)p + o_tr);
+    if(!tr) return false;
+    void* pp = inv0(m_getpos, tr);
+    if(!pp) return false;
+    rv3(pp, hx, hy, hz);
+    hy += HEAD_H;
+    return true;
+}
+
+static void update_target(){
+    g_tv = false;
+    if(!g_local || !g_cam || !mgr_cls) return;
+
+    void* mf = p_class_get_field_from_name(mgr_cls, MGR_INST);
+    if(!mf) return;
+    int o = p_field_get_offset(mf);
+    void* mgr = *(void**)((uint8_t*)mgr_cls + o);
+    if(!mgr || o_li < 0) return;
+    void* list = *(void**)((uint8_t*)mgr + o_li);
+    if(!list) return;
+    void* items = li_items(list);
+    int sz = li_size(list);
+    if(!items || sz <= 0) return;
+
+    void* cp = inv0(m_getpos, g_cam);
+    float cx,cy,cz; rv3(cp,cx,cy,cz);
+
+    float best = FOV_PX, bx=0, by=0; bool ok=false;
+    void** arr = (void**)((uint8_t*)items + 0x10);
+    for(int i=0;i<sz;i++){
+        void* pl = arr[i];
+        if(!pl || pl==g_local) continue;
+        int t = *(int*)((uint8_t*)pl + o_tm);
+        if(t == g_team) continue;
+
+        float hx,hy,hz;
+        if(!head_world(pl, hx,hy,hz)) continue;
+
+        float dx=hx-cx, dy=hy-cy, dz=hz-cz;
+        float d = sqrtf(dx*dx+dy*dy+dz*dz);
+        if(d < 1.5f || d > MAX_D) continue;
+
+        void* sb = inv1(m_w2s, g_cam, v3(hx,hy,hz));
+        float sx,sy,sz2; rv3(sb,sx,sy,sz2);
+        if(sz2 < 0) continue;
+
+        float sdx = sx - SCR_W*0.5f;
+        float sdy = sy - SCR_H*0.5f;
+        float sd  = sqrtf(sdx*sdx + sdy*sdy);
+        if(sd < best){ best=sd; bx=sx; by=sy; ok=true; }
+    }
+    if(ok){ g_tx=bx; g_ty=by; g_tv=true; }
+}
+
+// ===== SPR hook =====
+typedef Ray (*SprFn)(void*, V3);
+static SprFn orig_spr = nullptr;
+
+static Ray hook_spr(void* cam, V3 pos){
+    if(cam == g_cam && g_tv){
+        V3 r{ g_tx, g_ty, 0.0f };
+        return orig_spr(cam, r);
+    }
+    return orig_spr(cam, pos);
+}
+
+// ===== worker =====
+static void* worker(void*){
+    p_thread_attach(p_domain_get());
+    usleep(2000000);
+    while(1){
+        if(!plr_cls){
+            plr_cls = find_cls("", PLAYER_CLS);
+            mgr_cls = find_cls("", MGR_CLS);
+            tr_cls  = find_cls("UnityEngine","Transform");
+            cam_cls = find_cls("UnityEngine","Camera");
+            if(plr_cls && mgr_cls && tr_cls && cam_cls){
+                o_tr = p_field_get_offset(p_class_get_field_from_name(plr_cls, TR_FLD));
+                o_tm = p_field_get_offset(p_class_get_field_from_name(plr_cls, TEAM_FLD));
+                o_pv = p_field_get_offset(p_class_get_field_from_name(plr_cls, PIVOT_FLD));
+                o_li = p_field_get_offset(p_class_get_field_from_name(mgr_cls, LIST_FLD));
+                m_getpos = p_class_get_method_from_name(tr_cls, "get_position", 0);
+                m_w2s    = p_class_get_method_from_name(cam_cls, "WorldToScreenPoint", 1);
+            }
+        }
+        if(plr_cls && !g_local){
+            void* mf = p_class_get_field_from_name(mgr_cls, MGR_INST);
+            if(mf){
+                int o = p_field_get_offset(mf);
+                void* mgr = *(void**)((uint8_t*)mgr_cls + o);
+                if(mgr && o_li >= 0){
+                    void* list = *(void**)((uint8_t*)mgr + o_li);
+                    if(list){
+                        void* items = li_items(list);
+                        int sz = li_size(list);
+                        if(items && sz > 0){
+                            void** arr = (void**)((uint8_t*)items + 0x10);
+                            g_local = arr[0];
+                            if(g_local){
+                                g_team = *(int*)((uint8_t*)g_local + o_tm);
+                                void* m = p_class_get_method_from_name(cam_cls,"get_main",0);
+                                g_cam = inv0(m, cam_cls);
+
+                                void* spm = p_class_get_method_from_name(cam_cls,"ScreenPointToRay",1);
+                                void* nat = method_native(spm);
+                                if(nat && !orig_spr){
+                                    DobbyHook((void*)nat, (void*)hook_spr, (void**)&orig_spr);
+                                    LOG("SPR hooked %p", nat);
+                                }
+                                LOG("ready team=%d", g_team);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if(g_local) update_target();
+        usleep(TICK_US);
+    }
+    return nullptr;
+}
+
+static bool bind(){
+    void* h = dlopen("libil2cpp.so", RTLD_NOW);
+    if(!h) return false;
+    #define B(n,v) v=(fn_##n)dlsym(h,"il2cpp_"#n); if(!v) return false;
+    B(domain_get,p_domain_get) B(domain_get_assemblies,p_domain_get_assemblies)
+    B(assembly_get_image,p_assembly_get_image) B(class_from_name,p_class_from_name)
+    B(class_get_method_from_name,p_class_get_method_from_name)
+    B(class_get_field_from_name,p_class_get_field_from_name)
+    B(field_get_offset,p_field_get_offset) B(runtime_invoke,p_runtime_invoke)
+    B(thread_attach,p_thread_attach)
+    #undef B
+    dl_iterate_phdr(phdr_cb, nullptr);
+    return true;
+}
+
+__attribute__((constructor))
+static void on_load(){
+    pthread_t t;
+    pthread_create(&t,nullptr,[](void*)->void*{
+        for(int i=0;i<120;i++){ if(bind()) return worker(nullptr); usleep(500000); }
+        return (void*)nullptr;
+    },nullptr);
+}
+JNIEXPORT jint JNI_OnLoad(JavaVM*, void*){ return JNI_VERSION_1_6; }
