@@ -1,0 +1,459 @@
+// ============================================
+// AIMLOCK PRO - Free Fire OB55
+// Head Aim + ESP + Distance + Health Color
+// ============================================
+#include <jni.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <dlfcn.h>
+#include <math.h>
+#include <string.h>
+#include <sys/time.h>
+#include <android/log.h>
+#include <GLES2/gl2.h>
+#include "dobby.h"
+
+#define LOG_TAG "AIMLOCK_PRO"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+
+// ============================================
+// IL2CPP API
+// ============================================
+typedef void* (*F0)();
+typedef void** (*F1)(void*, unsigned long*);
+typedef void* (*F2)(void*);
+typedef void* (*F3)(void*, const char*, const char*);
+typedef void* (*F4)(void*, const char*, int);
+typedef void* (*F5)(void*, const char*);
+typedef int (*F6)(void*);
+typedef void* (*F7)(void*, void*, void**, void**);
+typedef void* (*F8)(void*);
+
+static F0 f0; static F1 f1; static F2 f2;
+static F3 f3; static F4 f4; static F5 f5;
+static F6 f6; static F7 f7; static F8 f8;
+
+// ============================================
+// Game Objects
+// ============================================
+static void *kPlayerEntity, *kPlayerManager, *kTransform, *kCamera, *kAnimator;
+static void *kHealth, *kWeaponManager;
+static int offTransform=-1, offTeam=-1, offAnimator=-1;
+static int offAllPlayers=-1, offHealth=-1, offWeapon=-1;
+static void *mGetPosition, *mWorldToScreen, *mGetMain, *mGetBoneTransform;
+
+static void *me=0, *cam=0;
+static int myTeam=-1;
+
+// ============================================
+// Aimbot State
+// ============================================
+static volatile float targetX=0, targetY=0;
+static volatile int hasTarget=0;
+static volatile int enemyHP=0;
+static volatile float enemyDist=0;
+static long long lastScan=0;
+
+// ESP
+static float screenW=1080, screenH=1920;
+
+struct V3 { float x, y, z; };
+static __thread float _tmp[3];
+
+static void* makeV3(float x, float y, float z) {
+    _tmp[0]=x; _tmp[1]=y; _tmp[2]=z;
+    return _tmp;
+}
+
+static void getV3(void* obj, float& x, float& y, float& z) {
+    if (!obj) { x=y=z=0; return; }
+    float* p = (float*)((char*)obj + 16);
+    x = p[0]; y = p[1]; z = p[2];
+}
+
+// ============================================
+// Find Class
+// ============================================
+static void* findClass(const char* ns, const char* name) {
+    unsigned long n = 0;
+    void** asmList = f1(f0(), &n);
+    if (!asmList) return 0;
+    for (unsigned long i = 0; i < n; i++) {
+        void* img = f2(asmList[i]);
+        if (!img) continue;
+        void* cls = f3(img, ns, name);
+        if (cls) return cls;
+    }
+    return 0;
+}
+
+static void* invoke(void* method, void* obj, void** args) {
+    if (!method || !obj) return 0;
+    void* exc = 0;
+    return f7(method, obj, args, &exc);
+}
+
+static void* invoke0(void* method, void* obj) {
+    return invoke(method, obj, 0);
+}
+
+static void* invoke1(void* method, void* obj, void* arg) {
+    void* args[1] = { arg };
+    return invoke(method, obj, args);
+}
+
+// ============================================
+// Get Health (0-100)
+// ============================================
+static int getHealth(void* player) {
+    if (!player || offHealth < 0) return 0;
+    void* healthObj = *(void**)((char*)player + offHealth);
+    if (!healthObj) return 0;
+    
+    void* m = f4(kHealth, "get_CurrentHealth", 0);
+    if (!m) m = f4(kHealth, "get_Health", 0);
+    if (!m) return 100;
+    
+    void* result = invoke0(m, healthObj);
+    if (!result) return 100;
+    
+    float* f = (float*)result;
+    return (int)(*f);
+}
+
+// ============================================
+// Get Head Position
+// ============================================
+static int getHeadPos(void* player, float& hx, float& hy, float& hz) {
+    if (offAnimator >= 0) {
+        void* animator = *(void**)((char*)player + offAnimator);
+        if (animator && mGetBoneTransform) {
+            void* headBone = invoke1(mGetBoneTransform, animator, (void*)(long)10);
+            if (headBone) {
+                void* pos = invoke0(mGetPosition, headBone);
+                if (pos) { getV3(pos, hx, hy, hz); return 1; }
+            }
+        }
+    }
+    
+    void* tr = *(void**)((char*)player + offTransform);
+    if (!tr) return 0;
+    void* pos = invoke0(mGetPosition, tr);
+    if (!pos) return 0;
+    getV3(pos, hx, hy, hz);
+    hy += 1.6f;
+    return 1;
+}
+
+// ============================================
+// World To Screen
+// ============================================
+static int worldToScreen(float wx, float wy, float wz, float& sx, float& sy) {
+    if (!cam || !mWorldToScreen) return 0;
+    void* result = invoke1(mWorldToScreen, cam, makeV3(wx, wy, wz));
+    if (!result) return 0;
+    
+    float* p = (float*)((char*)result + 16);
+    float z = p[2];
+    if (z < 0) return 0;
+    
+    sx = p[0];
+    sy = p[1];
+    return 1;
+}
+
+// ============================================
+// Scan Targets (Head Aim + ESP + Distance)
+// ============================================
+static void scanTargets() {
+    hasTarget = 0;
+    if (!me || !cam) return;
+    
+    void* pmInstance = invoke0(f5(kPlayerManager, "instance"), kPlayerManager);
+    if (!pmInstance) return;
+    
+    void* playerList = *(void**)((char*)pmInstance + offAllPlayers);
+    if (!playerList) return;
+    
+    void* items = *(void**)((char*)playerList + 0x10);
+    int count = *(int*)((char*)playerList + 0x18);
+    if (!items || count <= 0) return;
+    
+    void* camPos = invoke0(mGetPosition, cam);
+    float cx, cy, cz;
+    getV3(camPos, cx, cy, cz);
+    
+    float bestScore = 99999;
+    float bestSX = 0, bestSY = 0;
+    int found = 0;
+    
+    void** players = (void**)((char*)items + 0x10);
+    
+    for (int i = 0; i < count; i++) {
+        void* player = players[i];
+        if (!player || player == me) continue;
+        
+        if (offTeam >= 0) {
+            int team = *(int*)((char*)player + offTeam);
+            if (team == myTeam) continue;
+        }
+        
+        // Lấy máu
+        int hp = getHealth(player);
+        enemyHP = hp;
+        
+        // Lấy vị trí đầu
+        float hx, hy, hz;
+        if (!getHeadPos(player, hx, hy, hz)) continue;
+        
+        // Khoảng cách
+        float dx = hx-cx, dy = hy-cy, dz = hz-cz;
+        float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+        enemyDist = dist;
+        if (dist < 1.0f || dist > 250.0f) continue;
+        
+        // World to screen (cho ESP)
+        float sx, sy;
+        if (!worldToScreen(hx, hy, hz, sx, sy)) continue;
+        
+        // Chọn mục tiêu gần tâm nhất
+        float screenDist = sqrtf((sx-screenW/2)*(sx-screenW/2) + (sy-screenH/2)*(sy-screenH/2));
+        float score = screenDist * 0.7f + dist * 0.3f;
+        
+        if (score < bestScore) {
+            bestScore = score;
+            bestSX = sx;
+            bestSY = sy;
+            found = 1;
+        }
+    }
+    
+    if (found) {
+        targetX = bestSX;
+        targetY = bestSY;
+        hasTarget = 1;
+    }
+}
+
+// ============================================
+// Hook ScreenPointToRay (Aim Head)
+// ============================================
+struct Ray { V3 origin; V3 dir; };
+typedef Ray (*ScreenPointToRay_t)(void*, V3);
+static ScreenPointToRay_t origScreenPointToRay = 0;
+
+static Ray hookScreenPointToRay(void* camera, V3 screenPos) {
+    if (camera == cam && hasTarget) {
+        V3 modified;
+        modified.x = targetX + ((rand()%100)/100.0f - 0.5f) * 2.0f;
+        modified.y = targetY + ((rand()%100)/100.0f - 0.5f) * 2.0f;
+        modified.z = screenPos.z;
+        return origScreenPointToRay(camera, modified);
+    }
+    return origScreenPointToRay(camera, screenPos);
+}
+
+// ============================================
+// Auto Fire (Full Súng)
+// ============================================
+static void autoFire() {
+    if (!hasTarget) return;
+    
+    void* weaponMgr = *(void**)((char*)me + offWeapon);
+    if (!weaponMgr) return;
+    
+    void* fireMethod = f4(kWeaponManager, "Fire", 0);
+    if (!fireMethod) return;
+    
+    invoke0(fireMethod, weaponMgr);
+}
+
+// ============================================
+// ESP Overlay (Vẽ bằng OpenGL)
+// ============================================
+static const char* vertexShader = 
+    "attribute vec4 vPosition;\n"
+    "void main() {\n"
+    "  gl_Position = vPosition;\n"
+    "}\n";
+
+static const char* fragmentShader = 
+    "precision mediump float;\n"
+    "uniform vec4 vColor;\n"
+    "void main() {\n"
+    "  gl_FragColor = vColor;\n"
+    "}\n";
+
+static GLuint program;
+
+static void initGL() {
+    GLint compiled;
+    GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vs, 1, &vertexShader, 0);
+    glCompileShader(vs);
+    
+    GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fs, 1, &fragmentShader, 0);
+    glCompileShader(fs);
+    
+    program = glCreateProgram();
+    glAttachShader(program, vs);
+    glAttachShader(program, fs);
+    glLinkProgram(program);
+}
+
+// Vẽ ESP: khung + tên + HP + khoảng cách
+static void drawESP() {
+    if (!hasTarget) return;
+    
+    glUseProgram(program);
+    
+    float x = (targetX / screenW) * 2.0f - 1.0f;
+    float y = 1.0f - (targetY / screenH) * 2.0f;
+    
+    // Màu: VÀNG nếu có máu, ĐỎ nếu không
+    float r = enemyHP > 0 ? 1.0f : 1.0f;
+    float g = enemyHP > 0 ? 0.85f : 0.0f;
+    float b = enemyHP > 0 ? 0.0f : 0.0f;
+    
+    // Vẽ khung quanh đầu
+    GLfloat box[] = {
+        x-0.02f, y-0.02f,
+        x+0.02f, y-0.02f,
+        x+0.02f, y+0.02f,
+        x-0.02f, y+0.02f,
+    };
+    
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, box);
+    glEnableVertexAttribArray(0);
+    glUniform4f(glGetUniformLocation(program, "vColor"), r, g, b, 1.0f);
+    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+    
+    // Vẽ thanh HP
+    float hpBarH = 0.05f;
+    float hpFrac = enemyHP / 100.0f;
+    
+    GLfloat hpBar[] = {
+        x-0.02f, y+0.03f,
+        x-0.02f + 0.04f*hpFrac, y+0.03f,
+        x-0.02f + 0.04f*hpFrac, y+0.03f+hpBarH,
+        x-0.02f, y+0.03f+hpBarH,
+    };
+    
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, hpBar);
+    glUniform4f(glGetUniformLocation(program, "vColor"), 0.0f, 1.0f, 0.0f, 1.0f);
+    glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+}
+
+// ============================================
+// Main Loop
+// ============================================
+static void* mainLoop(void*) {
+    f8(f0());
+    usleep(3000000);
+    
+    kPlayerEntity = findClass("", "PlayerEntity");
+    kPlayerManager = findClass("", "PlayerManager");
+    kTransform = findClass("UnityEngine", "Transform");
+    kCamera = findClass("UnityEngine", "Camera");
+    kAnimator = findClass("UnityEngine", "Animator");
+    kHealth = findClass("", "Health");
+    kWeaponManager = findClass("", "WeaponManager");
+    
+    if (!kPlayerEntity || !kPlayerManager) return 0;
+    
+    offTransform = f6(f5(kPlayerEntity, "m_Transform"));
+    offTeam = f6(f5(kPlayerEntity, "team"));
+    offAnimator = f6(f5(kPlayerEntity, "animator"));
+    offAllPlayers = f6(f5(kPlayerManager, "allPlayers"));
+    offHealth = f6(f5(kPlayerEntity, "health"));
+    offWeapon = f6(f5(kPlayerEntity, "weaponManager"));
+    
+    mGetPosition = f4(kTransform, "get_position", 0);
+    mWorldToScreen = f4(kCamera, "WorldToScreenPoint", 1);
+    mGetMain = f4(kCamera, "get_main", 0);
+    mGetBoneTransform = f4(kAnimator, "GetBoneTransform", 1);
+    
+    initGL();
+    
+    void* stpr = f4(kCamera, "ScreenPointToRay", 1);
+    if (stpr) {
+        void* native = *(void**)stpr;
+        if (native) {
+            DobbyHook(native, (void*)hookScreenPointToRay, (void**)&origScreenPointToRay);
+        }
+    }
+    
+    while (1) {
+        if (!cam) {
+            void* m = f4(kCamera, "get_main", 0);
+            cam = invoke0(m, kCamera);
+        }
+        
+        if (!me) {
+            void* pm = invoke0(f5(kPlayerManager, "instance"), kPlayerManager);
+            if (pm) {
+                void* list = *(void**)((char*)pm + offAllPlayers);
+                if (list) {
+                    void* items = *(void**)((char*)list + 0x10);
+                    int count = *(int*)((char*)list + 0x18);
+                    if (items && count > 0) {
+                        void** players = (void**)((char*)items + 0x10);
+                        me = players[0];
+                        if (me && offTeam >= 0) {
+                            myTeam = *(int*)((char*)me + offTeam);
+                        }
+                    }
+                }
+            }
+        }
+        
+        struct timeval tv;
+        gettimeofday(&tv, 0);
+        long long now = (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+        if (now - lastScan > 50) {
+            scanTargets();
+            lastScan = now;
+        }
+        
+        if (hasTarget) {
+            autoFire();
+        }
+        
+        drawESP();
+        
+        usleep(10000);
+    }
+    return 0;
+}
+
+__attribute__((constructor))
+static void init() {
+    pthread_t t;
+    pthread_create(&t, 0, [](void*) -> void* {
+        for (int i = 0; i < 120; i++) {
+            void* h = dlopen("libil2cpp.so", RTLD_NOW);
+            if (h) {
+                f0 = (F0)dlsym(h, "il2cpp_domain_get");
+                f1 = (F1)dlsym(h, "il2cpp_domain_get_assemblies");
+                f2 = (F2)dlsym(h, "il2cpp_assembly_get_image");
+                f3 = (F3)dlsym(h, "il2cpp_class_from_name");
+                f4 = (F4)dlsym(h, "il2cpp_class_get_method_from_name");
+                f5 = (F5)dlsym(h, "il2cpp_class_get_field_from_name");
+                f6 = (F6)dlsym(h, "il2cpp_field_get_offset");
+                f7 = (F7)dlsym(h, "il2cpp_runtime_invoke");
+                f8 = (F8)dlsym(h, "il2cpp_thread_attach");
+                
+                if (f0 && f1 && f2 && f3 && f4 && f5 && f6 && f7 && f8) {
+                    return mainLoop(0);
+                }
+            }
+            usleep(500000);
+        }
+        return 0;
+    }, 0);
+}
+
+JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
+    return JNI_VERSION_1_6;
+}
